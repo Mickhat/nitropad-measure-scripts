@@ -1,0 +1,65 @@
+#!/bin/bash
+#
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 mickhat  (https://mickhat.xyz)
+# Sample per-qube memory and CPU from dom0 into a CSV.
+#
+# Every INTERVAL seconds it appends one row per running domain:
+#   timestamp, qube, mem_mb, cpu_pct, running_count, uptime_s
+# plus a _TOTAL_ row with summed memory and the running count.
+#
+# Runs in dom0. Read-only: it calls xentop and xl uptime, writes one CSV,
+# needs no network. Stop with Ctrl-C.
+#
+# Usage:  ./qubes-session-recorder.sh [interval_s] [out.csv]
+#   ./qubes-session-recorder.sh          # 5 s, auto-named file
+#   ./qubes-session-recorder.sh 10 ~/session.csv
+
+set -u
+
+INTERVAL="${1:-5}"
+OUT="${2:-$HOME/qubes-session-$(date +%Y%m%d-%H%M%S).csv}"
+
+command -v xentop >/dev/null 2>&1 || { echo "missing: xentop" >&2; exit 1; }
+
+echo "timestamp,qube,mem_mb,cpu_pct,running_count,uptime_s" > "$OUT"
+echo "recording every ${INTERVAL}s -> $OUT   (Ctrl-C to stop)" >&2
+
+sample() {
+  local ts snap count total_mem
+  ts="$(date +%Y-%m-%dT%H:%M:%S)"
+
+  # Two iterations; the second has real (non-cumulative) CPU%. The header
+  # line is indented, so match on content rather than start-of-line.
+  snap="$(sudo xentop -b -f -i 2 2>/dev/null | awk '
+      /NAME/ && /STATE/ { blk++; next }
+      blk==2 && NF { print }
+  ')"
+
+  if [ -z "$snap" ]; then
+    snap="$(sudo xentop -b -f -i 1 2>/dev/null | awk '
+        /NAME/ && /STATE/ { seen=1; next }
+        seen && NF { print }
+    ')"
+  fi
+
+  count="$(echo "$snap" | awk 'NF && $1!="Domain-0"{c++} END{print c+0}')"
+  total_mem=0
+
+  while read -r name state cpusec cpupct memk rest; do
+    [ -z "${name:-}" ] && continue
+    case "$memk" in ''|*[!0-9]*) memk=0 ;; esac
+    local mem_mb=$(( memk / 1024 ))
+    [ "$name" != "Domain-0" ] && total_mem=$(( total_mem + mem_mb ))
+    local up
+    up="$(sudo xl uptime "$name" 2>/dev/null | awk 'NR==2{print $3}')"
+    echo "$ts,$name,$mem_mb,$cpupct,$count,${up:-}" >> "$OUT"
+  done <<< "$snap"
+
+  echo "$ts,_TOTAL_,$total_mem,,$count," >> "$OUT"
+}
+
+while true; do
+  sample
+  sleep "$INTERVAL"
+done
